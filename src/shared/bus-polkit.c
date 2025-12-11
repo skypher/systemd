@@ -1,5 +1,4 @@
 /* SPDX-License-Identifier: LGPL-2.1-or-later */
-/* Test: non-neuralgic change */
 
 #include <unistd.h>
 
@@ -540,7 +539,6 @@ static int async_polkit_query_check_action(
  * <- async_polkit_defer(q)
  */
 
-/* Test 2: neuralgic pattern - bus_verify_polkit_async triggered */
 int bus_verify_polkit_async_full(
                 sd_bus_message *call,
                 const char *action,
