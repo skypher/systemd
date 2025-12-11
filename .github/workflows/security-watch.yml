@@ -97,5 +97,6 @@ jobs:
             - [ ] Authorization checks still happen before namespace FD opening
             - [ ] \`namespace_open()\` still called at execution time, not check time
             - [ ] No machine name-based re-lookup after authorization`,
-              labels: ['security-watch']
+              labels: ['security-watch'],
+              assignees: ['skypher']
             });
