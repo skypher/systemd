@@ -140,17 +140,19 @@ jobs:
           echo "EOF" >> $GITHUB_OUTPUT
 
       - name: Create security review issue
+        env:
+          DETAILS: ${{ needs.check.outputs.details }}
+          COMMIT_MSG: ${{ steps.commit.outputs.message }}
+          DIFF_EXCERPT: ${{ steps.diff.outputs.excerpt }}
         uses: actions/github-script@v7
         with:
           script: |
-            const details = `${{ needs.check.outputs.details }}`;
+            const details = process.env.DETAILS || '(manual trigger - no pattern analysis)';
+            const commitMsg = process.env.COMMIT_MSG || '';
+            const diffExcerpt = process.env.DIFF_EXCERPT || '';
             const isManual = context.eventName === 'workflow_dispatch';
 
-            await github.rest.issues.create({
-              owner: context.repo.owner,
-              repo: context.repo.repo,
-              title: `[Security Watch] ${{ steps.commit.outputs.title }}`,
-              body: `## Security-Critical Code Changed
+            const body = `## Security-Critical Code Changed
 
             ${isManual ? '⚠️ *Manual test run*' : '🚨 **Neuralgic code patterns were modified**'}
 
@@ -163,11 +165,11 @@ jobs:
 
             ### Commit message
             \`\`\`
-            ${{ steps.commit.outputs.message }}
+            ${commitMsg}
             \`\`\`
 
             ### Critical patterns modified
-            ${details || '(manual trigger - no pattern analysis)'}
+            ${details}
 
             ### Changed files
             \`\`\`
@@ -176,7 +178,7 @@ jobs:
 
             ### Diff excerpt
             \`\`\`diff
-            ${{ steps.diff.outputs.excerpt }}
+            ${diffExcerpt}
             \`\`\`
 
             ---
@@ -203,7 +205,13 @@ jobs:
             - [ ] No connection pooling/reuse added
             - [ ] \`namespace_open()\` still called at execution time
             - [ ] No polkit bypass paths added
-            - [ ] No dangerous syscalls unblocked in seccomp`,
+            - [ ] No dangerous syscalls unblocked in seccomp`;
+
+            await github.rest.issues.create({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              title: `[Security Watch] ${{ steps.commit.outputs.title }}`,
+              body: body,
               labels: ['security-watch'],
               assignees: ['skypher']
             });
