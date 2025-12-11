@@ -540,6 +540,7 @@ static int async_polkit_query_check_action(
  * <- async_polkit_defer(q)
  */
 
+/* Test: neuralgic pattern - bus_verify_polkit_async */
 int bus_verify_polkit_async_full(
                 sd_bus_message *call,
                 const char *action,
