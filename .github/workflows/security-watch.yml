@@ -58,6 +58,23 @@ jobs:
           Review for: FD caching, connection pooling, authorization reordering.
           EOF
 
+      - name: Get commit info
+        id: commit
+        run: |
+          # For manual dispatch, get latest commit info
+          echo "sha=$(git rev-parse HEAD)" >> $GITHUB_OUTPUT
+          echo "short_sha=$(git rev-parse --short HEAD)" >> $GITHUB_OUTPUT
+          echo "author=$(git log -1 --format='%an')" >> $GITHUB_OUTPUT
+          echo "date=$(git log -1 --format='%ci')" >> $GITHUB_OUTPUT
+          echo "url=https://github.com/${{ github.repository }}/commit/$(git rev-parse HEAD)" >> $GITHUB_OUTPUT
+          # Handle multiline message
+          MSG=$(git log -1 --format='%B')
+          echo "message<<EOF" >> $GITHUB_OUTPUT
+          echo "$MSG" >> $GITHUB_OUTPUT
+          echo "EOF" >> $GITHUB_OUTPUT
+          TITLE=$(git log -1 --format='%s' | cut -c1-60)
+          echo "title=$TITLE" >> $GITHUB_OUTPUT
+
       - name: Create security review issue
         uses: actions/github-script@v7
         with:
@@ -65,21 +82,21 @@ jobs:
             await github.rest.issues.create({
               owner: context.repo.owner,
               repo: context.repo.repo,
-              title: `[Security Watch] ${context.payload.head_commit.message.split('\n')[0].substring(0, 60)}`,
+              title: `[Security Watch] ${{ steps.commit.outputs.title }}`,
               body: `## Security-Sensitive File Changed
 
             A commit in upstream systemd touched namespace handling code that is security-critical.
 
             | Field | Value |
             |-------|-------|
-            | **Commit** | \`${context.sha.substring(0, 12)}\` |
-            | **Author** | ${context.payload.head_commit.author.name} |
-            | **Date** | ${context.payload.head_commit.timestamp} |
-            | **URL** | ${context.payload.head_commit.url} |
+            | **Commit** | \`${{ steps.commit.outputs.short_sha }}\` |
+            | **Author** | ${{ steps.commit.outputs.author }} |
+            | **Date** | ${{ steps.commit.outputs.date }} |
+            | **URL** | ${{ steps.commit.outputs.url }} |
 
             ### Commit message
             \`\`\`
-            ${context.payload.head_commit.message}
+            ${{ steps.commit.outputs.message }}
             \`\`\`
 
             ### Changed files
