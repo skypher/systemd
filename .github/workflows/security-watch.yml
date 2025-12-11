@@ -9,6 +9,7 @@ on:
       - 'src/machine/machine.c'
       - 'src/machine/machine-dbus.c'
       - 'src/basic/namespace-util.c'
+  workflow_dispatch:  # Allow manual testing
 
 jobs:
   alert:
