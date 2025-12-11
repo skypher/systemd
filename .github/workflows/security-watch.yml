@@ -1,6 +1,6 @@
 name: Security-sensitive file monitor
 
-# Triggers when security-critical namespace handling code changes
+# Triggers when security-critical files change, then filters to specific code patterns
 on:
   push:
     branches: [main]
@@ -14,7 +14,89 @@ on:
   workflow_dispatch:  # Allow manual testing
 
 jobs:
+  check:
+    runs-on: ubuntu-latest
+    outputs:
+      dominated: ${{ steps.analyze.outputs.dominated }}
+      details: ${{ steps.analyze.outputs.details }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 2
+
+      - name: Analyze changes for security impact
+        id: analyze
+        run: |
+          # Get the diff for changed files
+          DOMINATED="false"
+          DETAILS=""
+
+          # Define neuralgic patterns - these are the critical code points
+          # Format: "filename:pattern:description"
+          WATCHPOINTS=(
+            # TOCTOU race - namespace FD handling
+            "bus-container.c:namespace_open:namespace FD opening - critical for TOCTOU safety"
+            "bus-container.c:namespace_fork:namespace entry point"
+            "bus-container.c:b->nspid:PID used for namespace lookup"
+
+            # TOCTOU race - machine connection
+            "machine.c:machine_bus_new:container bus connection creation"
+            "machine.c:x-machine-unix:container bus address format"
+            "machine.c:m->leader:leader PID reference"
+
+            # TOCTOU race - authorization check
+            "machine-dbus.c:pidref_in_same_namespace:namespace authorization check"
+            "machine-dbus.c:bus_machine_method_open_shell:shell access method"
+            "machine-dbus.c:bus_verify_polkit:privilege check in machine methods"
+
+            # Namespace utilities
+            "namespace-util.c:namespace_open:core namespace FD opening"
+            "namespace-util.c:namespace_fork:core namespace entry"
+            "namespace-util.c:setns:direct namespace switch"
+
+            # Polkit authorization
+            "bus-polkit.c:bus_verify_polkit_async:main authorization function"
+            "bus-polkit.c:async_polkit_query:authorization query handling"
+            "bus-polkit.c:process_reply:authorization response processing"
+
+            # Seccomp sandbox
+            "nspawn-seccomp.c:allow_list:syscall allowlist definition"
+            "nspawn-seccomp.c:SCMP_ACT_ALLOW:syscall permission grants"
+            "nspawn-seccomp.c:add_syscall_filters:filter construction"
+            "nspawn-seccomp.c:seccomp_add_syscall_filter_item:individual syscall rules"
+            "nspawn-seccomp.c:CAP_:capability-gated syscalls"
+          )
+
+          # Check each watchpoint against the diff
+          for wp in "${WATCHPOINTS[@]}"; do
+            FILE=$(echo "$wp" | cut -d: -f1)
+            PATTERN=$(echo "$wp" | cut -d: -f2)
+            DESC=$(echo "$wp" | cut -d: -f3-)
+
+            # Check if this file was changed and contains the pattern in diff
+            if git diff HEAD~1 HEAD --unified=0 -- "*/$FILE" 2>/dev/null | grep -qE "^[+-].*$PATTERN"; then
+              DOMINATED="true"
+              DETAILS="${DETAILS}\n- **${FILE}**: \`${PATTERN}\` - ${DESC}"
+            fi
+          done
+
+          echo "dominated=$DOMINATED" >> $GITHUB_OUTPUT
+
+          # Handle multiline output
+          echo "details<<EOF" >> $GITHUB_OUTPUT
+          echo -e "$DETAILS" >> $GITHUB_OUTPUT
+          echo "EOF" >> $GITHUB_OUTPUT
+
+          if [ "$DOMINATED" = "true" ]; then
+            echo "::warning::Security-critical code patterns modified!"
+          else
+            echo "::notice::Changed files are watched but no critical patterns were modified"
+          fi
+
   alert:
+    needs: check
+    if: needs.check.outputs.dominated == 'true' || github.event_name == 'workflow_dispatch'
     runs-on: ubuntu-latest
     steps:
       - name: Checkout
@@ -30,46 +112,14 @@ jobs:
           echo "$CHANGED" >> $GITHUB_OUTPUT
           echo "EOF" >> $GITHUB_OUTPUT
 
-      - name: Build alert message
-        id: message
-        run: |
-          cat << 'EOF' > /tmp/alert.md
-          ## ⚠️ Security-Sensitive File Changed in systemd
-
-          **Commit:** ${{ github.sha }}
-          **Author:** ${{ github.event.head_commit.author.name }}
-          **Message:** ${{ github.event.head_commit.message }}
-          **URL:** ${{ github.event.head_commit.url }}
-
-          ### Changed files:
-          ```
-          ${{ steps.changed.outputs.files }}
-          ```
-
-          ### Why this matters:
-          These files contain namespace handling code related to a potential TOCTOU race
-          condition in `machined`. The current design is safe because `namespace_open()`
-          opens FDs at execution time, but changes to these patterns could introduce
-          vulnerabilities:
-
-          - **bus-container.c**: `namespace_open()` call site - do not cache FDs
-          - **machine.c**: `machine_bus_new()` - do not reuse connections
-          - **machine-dbus.c**: Authorization checks - do not reorder
-          - **namespace-util.c**: Core namespace FD handling
-
-          Review for: FD caching, connection pooling, authorization reordering.
-          EOF
-
       - name: Get commit info
         id: commit
         run: |
-          # For manual dispatch, get latest commit info
           echo "sha=$(git rev-parse HEAD)" >> $GITHUB_OUTPUT
           echo "short_sha=$(git rev-parse --short HEAD)" >> $GITHUB_OUTPUT
           echo "author=$(git log -1 --format='%an')" >> $GITHUB_OUTPUT
           echo "date=$(git log -1 --format='%ci')" >> $GITHUB_OUTPUT
           echo "url=https://github.com/${{ github.repository }}/commit/$(git rev-parse HEAD)" >> $GITHUB_OUTPUT
-          # Handle multiline message
           MSG=$(git log -1 --format='%B')
           echo "message<<EOF" >> $GITHUB_OUTPUT
           echo "$MSG" >> $GITHUB_OUTPUT
@@ -77,17 +127,32 @@ jobs:
           TITLE=$(git log -1 --format='%s' | cut -c1-60)
           echo "title=$TITLE" >> $GITHUB_OUTPUT
 
+      - name: Get diff excerpt
+        id: diff
+        run: |
+          # Get relevant parts of the diff (limited to 100 lines)
+          DIFF=$(git diff HEAD~1 HEAD --unified=3 -- \
+            '*/bus-container.c' '*/machine.c' '*/machine-dbus.c' \
+            '*/namespace-util.c' '*/bus-polkit.c' '*/nspawn-seccomp.c' \
+            | head -100)
+          echo "excerpt<<EOF" >> $GITHUB_OUTPUT
+          echo "$DIFF" >> $GITHUB_OUTPUT
+          echo "EOF" >> $GITHUB_OUTPUT
+
       - name: Create security review issue
         uses: actions/github-script@v7
         with:
           script: |
+            const details = `${{ needs.check.outputs.details }}`;
+            const isManual = context.eventName === 'workflow_dispatch';
+
             await github.rest.issues.create({
               owner: context.repo.owner,
               repo: context.repo.repo,
               title: `[Security Watch] ${{ steps.commit.outputs.title }}`,
-              body: `## Security-Sensitive File Changed
+              body: `## Security-Critical Code Changed
 
-            A commit in upstream systemd touched namespace handling code that is security-critical.
+            ${isManual ? '⚠️ *Manual test run*' : '🚨 **Neuralgic code patterns were modified**'}
 
             | Field | Value |
             |-------|-------|
@@ -101,53 +166,44 @@ jobs:
             ${{ steps.commit.outputs.message }}
             \`\`\`
 
+            ### Critical patterns modified
+            ${details || '(manual trigger - no pattern analysis)'}
+
             ### Changed files
             \`\`\`
             ${{ steps.changed.outputs.files }}
             \`\`\`
 
+            ### Diff excerpt
+            \`\`\`diff
+            ${{ steps.diff.outputs.excerpt }}
+            \`\`\`
+
+            ---
+
             ### Background
 
             In Dec 2024 you audited systemd and identified these security-sensitive areas:
 
-            ---
-
-            **TOCTOU race in machined (bus-container.c, machine.c, machine-dbus.c, namespace-util.c)**
-
-            1. **The race window**: \`bus_machine_method_open_shell()\` checks if the caller can access the container's namespaces, then later \`machine_bus_new()\` connects using \`m->leader.pid\`.
-
-            2. **The attack**: Attacker registers container, calls OpenShell, kills leader between check and connection. If PID reused by privileged process, attacker gets shell there.
-
-            3. **Why it's currently safe**: \`bus_container_connect_socket()\` calls \`namespace_open(b->nspid, ...)\` **fresh at execution time**. Attacker can't control which process reuses the PID.
-
-            4. **What would break it**: Caching namespace FDs, connection pooling, separating "which namespaces" from "when we enter them".
-
-            ---
+            **TOCTOU race in machined**
+            - \`bus_machine_method_open_shell()\` checks namespace access, then \`machine_bus_new()\` connects using \`m->leader.pid\`
+            - Safe because \`namespace_open()\` opens FDs fresh at execution time
+            - **Would break if**: namespace FDs cached, connections pooled, or check/use separated
 
             **Polkit authorization (bus-polkit.c)**
+            - All privilege checks flow through \`bus_verify_polkit_async()\`
+            - **Watch for**: caching bugs, TOCTOU between check and action, bypass paths
 
-            All D-Bus privilege checks flow through \`bus_verify_polkit_async()\`. Watch for:
-            - Changes to authorization caching logic
-            - Race conditions between check and action
-            - Bypass paths that skip authorization
-
-            ---
-
-            **Container seccomp sandbox (nspawn-seccomp.c)**
-
-            Defines syscall filters for \`systemd-nspawn\` containers. Watch for:
-            - Syscalls being removed from blocklist
-            - New exceptions or bypass conditions
-            - Changes to capability handling
+            **Container seccomp (nspawn-seccomp.c)**
+            - Defines syscall allowlist for containers
+            - **Watch for**: dangerous syscalls added, capability gates removed
 
             ### Review checklist
             - [ ] No namespace FD caching introduced
             - [ ] No connection pooling/reuse added
-            - [ ] Authorization checks still happen before namespace FD opening
-            - [ ] \`namespace_open()\` still called at execution time, not check time
-            - [ ] No machine name-based re-lookup after authorization
-            - [ ] No polkit authorization bypass paths added
-            - [ ] No dangerous syscalls unblocked in seccomp filter`,
+            - [ ] \`namespace_open()\` still called at execution time
+            - [ ] No polkit bypass paths added
+            - [ ] No dangerous syscalls unblocked in seccomp`,
               labels: ['security-watch'],
               assignees: ['skypher']
             });
