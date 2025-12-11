@@ -61,13 +61,14 @@ jobs:
         if: ${{ vars.ALERT_EMAIL != '' }}
         uses: dawidd6/action-send-mail@v3
         with:
-          server_address: smtp.gmail.com
-          server_port: 587
-          username: ${{ secrets.SMTP_USERNAME }}
-          password: ${{ secrets.SMTP_PASSWORD }}
+          server_address: smtp.fastmail.com
+          server_port: 465
+          secure: true
+          username: ${{ secrets.FASTMAIL_USERNAME }}
+          password: ${{ secrets.FASTMAIL_APP_PASSWORD }}
           subject: "[systemd-security] Namespace handling code changed"
           to: ${{ vars.ALERT_EMAIL }}
-          from: GitHub Actions
+          from: ${{ secrets.FASTMAIL_USERNAME }}
           body: |
             Security-sensitive file changed in systemd.
 
