@@ -1,0 +1,183 @@
+name: Security-sensitive file monitor
+
+# Triggers when security-critical namespace handling code changes
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'src/libsystemd/sd-bus/bus-container.c'
+      - 'src/machine/machine.c'
+      - 'src/machine/machine-dbus.c'
+      - 'src/basic/namespace-util.c'
+
+jobs:
+  alert:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 2
+
+      - name: Get changed files
+        id: changed
+        run: |
+          CHANGED=$(git diff --name-only HEAD~1 HEAD | grep -E 'bus-container\.c|machine\.c|machine-dbus\.c|namespace-util\.c' || true)
+          echo "files<<EOF" >> $GITHUB_OUTPUT
+          echo "$CHANGED" >> $GITHUB_OUTPUT
+          echo "EOF" >> $GITHUB_OUTPUT
+
+      - name: Build alert message
+        id: message
+        run: |
+          cat << 'EOF' > /tmp/alert.md
+          ## ⚠️ Security-Sensitive File Changed in systemd
+
+          **Commit:** ${{ github.sha }}
+          **Author:** ${{ github.event.head_commit.author.name }}
+          **Message:** ${{ github.event.head_commit.message }}
+          **URL:** ${{ github.event.head_commit.url }}
+
+          ### Changed files:
+          ```
+          ${{ steps.changed.outputs.files }}
+          ```
+
+          ### Why this matters:
+          These files contain namespace handling code related to a potential TOCTOU race
+          condition in `machined`. The current design is safe because `namespace_open()`
+          opens FDs at execution time, but changes to these patterns could introduce
+          vulnerabilities:
+
+          - **bus-container.c**: `namespace_open()` call site - do not cache FDs
+          - **machine.c**: `machine_bus_new()` - do not reuse connections
+          - **machine-dbus.c**: Authorization checks - do not reorder
+          - **namespace-util.c**: Core namespace FD handling
+
+          Review for: FD caching, connection pooling, authorization reordering.
+          EOF
+
+      - name: Send email notification
+        if: ${{ vars.ALERT_EMAIL != '' }}
+        uses: dawidd6/action-send-mail@v3
+        with:
+          server_address: smtp.gmail.com
+          server_port: 587
+          username: ${{ secrets.SMTP_USERNAME }}
+          password: ${{ secrets.SMTP_PASSWORD }}
+          subject: "[systemd-security] Namespace handling code changed"
+          to: ${{ vars.ALERT_EMAIL }}
+          from: GitHub Actions
+          body: |
+            Security-sensitive file changed in systemd.
+
+            Commit: ${{ github.sha }}
+            Author: ${{ github.event.head_commit.author.name }}
+            Message: ${{ github.event.head_commit.message }}
+            URL: ${{ github.event.head_commit.url }}
+
+            Changed files:
+            ${{ steps.changed.outputs.files }}
+
+            Review for changes to namespace_open() usage, FD caching, or connection reuse.
+
+      - name: Send Slack notification
+        if: ${{ secrets.SLACK_WEBHOOK != '' }}
+        uses: slackapi/slack-github-action@v1.26.0
+        with:
+          payload: |
+            {
+              "text": "⚠️ systemd security-sensitive file changed",
+              "blocks": [
+                {
+                  "type": "header",
+                  "text": {
+                    "type": "plain_text",
+                    "text": "⚠️ Security-Sensitive File Changed"
+                  }
+                },
+                {
+                  "type": "section",
+                  "fields": [
+                    {"type": "mrkdwn", "text": "*Repo:*\nsystemd/systemd"},
+                    {"type": "mrkdwn", "text": "*Author:*\n${{ github.event.head_commit.author.name }}"}
+                  ]
+                },
+                {
+                  "type": "section",
+                  "text": {
+                    "type": "mrkdwn",
+                    "text": "*Message:*\n${{ github.event.head_commit.message }}"
+                  }
+                },
+                {
+                  "type": "section",
+                  "text": {
+                    "type": "mrkdwn",
+                    "text": "*Files:*\n```${{ steps.changed.outputs.files }}```"
+                  }
+                },
+                {
+                  "type": "section",
+                  "text": {
+                    "type": "mrkdwn",
+                    "text": "<${{ github.event.head_commit.url }}|View Commit>"
+                  }
+                }
+              ]
+            }
+        env:
+          SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK }}
+          SLACK_WEBHOOK_TYPE: INCOMING_WEBHOOK
+
+      - name: Send Discord notification
+        if: ${{ secrets.DISCORD_WEBHOOK != '' }}
+        run: |
+          curl -H "Content-Type: application/json" \
+            -d '{
+              "embeds": [{
+                "title": "⚠️ Security-Sensitive File Changed in systemd",
+                "color": 16744256,
+                "fields": [
+                  {"name": "Commit", "value": "'${{ github.sha }}'", "inline": true},
+                  {"name": "Author", "value": "'${{ github.event.head_commit.author.name }}'", "inline": true},
+                  {"name": "Message", "value": "'"$(echo '${{ github.event.head_commit.message }}' | head -c 200)"'"},
+                  {"name": "Files", "value": "```${{ steps.changed.outputs.files }}```"},
+                  {"name": "Review For", "value": "namespace_open() changes, FD caching, connection pooling"}
+                ],
+                "url": "'${{ github.event.head_commit.url }}'"
+              }]
+            }' \
+            ${{ secrets.DISCORD_WEBHOOK }}
+
+      - name: Create issue for review
+        if: ${{ vars.CREATE_ISSUES == 'true' }}
+        uses: actions/github-script@v7
+        with:
+          script: |
+            await github.rest.issues.create({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              title: `Security review needed: ${context.payload.head_commit.message.split('\n')[0]}`,
+              body: `## Automated Security Review Request
+
+            A commit touched security-sensitive namespace handling code.
+
+            **Commit:** ${context.sha}
+            **Author:** ${context.payload.head_commit.author.name}
+            **Message:** ${context.payload.head_commit.message}
+
+            ### Files changed:
+            \`\`\`
+            ${{ steps.changed.outputs.files }}
+            \`\`\`
+
+            ### Review checklist:
+            - [ ] No namespace FD caching introduced
+            - [ ] No connection pooling/reuse added
+            - [ ] Authorization checks still happen before namespace FD opening
+            - [ ] \`namespace_open()\` still called at execution time, not check time
+
+            [View commit](${context.payload.head_commit.url})`,
+              labels: ['security-review', 'automated']
+            });
