@@ -9,6 +9,8 @@ on:
       - 'src/machine/machine.c'
       - 'src/machine/machine-dbus.c'
       - 'src/basic/namespace-util.c'
+      - 'src/shared/bus-polkit.c'
+      - 'src/nspawn/nspawn-seccomp.c'
   workflow_dispatch:  # Allow manual testing
 
 jobs:
@@ -23,7 +25,7 @@ jobs:
       - name: Get changed files
         id: changed
         run: |
-          CHANGED=$(git diff --name-only HEAD~1 HEAD | grep -E 'bus-container\.c|machine\.c|machine-dbus\.c|namespace-util\.c' || true)
+          CHANGED=$(git diff --name-only HEAD~1 HEAD | grep -E 'bus-container\.c|machine\.c|machine-dbus\.c|namespace-util\.c|bus-polkit\.c|nspawn-seccomp\.c' || true)
           echo "files<<EOF" >> $GITHUB_OUTPUT
           echo "$CHANGED" >> $GITHUB_OUTPUT
           echo "EOF" >> $GITHUB_OUTPUT
@@ -106,22 +108,46 @@ jobs:
 
             ### Background
 
-            In Dec 2024 you audited systemd and found a TOCTOU race in machined's \`OpenShell\` D-Bus method:
+            In Dec 2024 you audited systemd and identified these security-sensitive areas:
 
-            1. **The race window**: \`bus_machine_method_open_shell()\` checks if the caller can access the container's namespaces (line ~377 in machine-dbus.c), then later \`machine_bus_new()\` connects to the container using \`m->leader.pid\`.
+            ---
 
-            2. **The attack**: An attacker registers a container, calls OpenShell, then kills the container leader between the check and the connection. If the PID gets reused by a privileged process, the attacker could get a shell in that process's namespaces.
+            **TOCTOU race in machined (bus-container.c, machine.c, machine-dbus.c, namespace-util.c)**
 
-            3. **Why it's currently safe**: \`bus_container_connect_socket()\` in bus-container.c calls \`namespace_open(b->nspid, ...)\` which opens namespace FDs **fresh at execution time**. If the PID was reused, the FDs point to the new process's namespaces (not the attacker's target). The attacker can't control which process reuses the PID.
+            1. **The race window**: \`bus_machine_method_open_shell()\` checks if the caller can access the container's namespaces, then later \`machine_bus_new()\` connects using \`m->leader.pid\`.
 
-            4. **What would break it**: Caching namespace FDs at check time, connection pooling, or any pattern that separates "which namespaces" from "when we enter them".
+            2. **The attack**: Attacker registers container, calls OpenShell, kills leader between check and connection. If PID reused by privileged process, attacker gets shell there.
+
+            3. **Why it's currently safe**: \`bus_container_connect_socket()\` calls \`namespace_open(b->nspid, ...)\` **fresh at execution time**. Attacker can't control which process reuses the PID.
+
+            4. **What would break it**: Caching namespace FDs, connection pooling, separating "which namespaces" from "when we enter them".
+
+            ---
+
+            **Polkit authorization (bus-polkit.c)**
+
+            All D-Bus privilege checks flow through \`bus_verify_polkit_async()\`. Watch for:
+            - Changes to authorization caching logic
+            - Race conditions between check and action
+            - Bypass paths that skip authorization
+
+            ---
+
+            **Container seccomp sandbox (nspawn-seccomp.c)**
+
+            Defines syscall filters for \`systemd-nspawn\` containers. Watch for:
+            - Syscalls being removed from blocklist
+            - New exceptions or bypass conditions
+            - Changes to capability handling
 
             ### Review checklist
             - [ ] No namespace FD caching introduced
             - [ ] No connection pooling/reuse added
             - [ ] Authorization checks still happen before namespace FD opening
             - [ ] \`namespace_open()\` still called at execution time, not check time
-            - [ ] No machine name-based re-lookup after authorization`,
+            - [ ] No machine name-based re-lookup after authorization
+            - [ ] No polkit authorization bypass paths added
+            - [ ] No dangerous syscalls unblocked in seccomp filter`,
               labels: ['security-watch'],
               assignees: ['skypher']
             });
