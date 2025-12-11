@@ -1,5 +1,4 @@
 /* SPDX-License-Identifier: LGPL-2.1-or-later */
-/* Security watch test - delete this line */
 
 #include <sched.h>
 #include <sys/stat.h>
