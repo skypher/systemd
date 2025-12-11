@@ -86,10 +86,17 @@ jobs:
             ${{ steps.changed.outputs.files }}
             \`\`\`
 
-            ### Why this matters
-            These files contain namespace handling code related to a TOCTOU race window in machined.
-            The current design is safe because \`namespace_open()\` opens FDs at execution time,
-            but changes could break this implicit protection.
+            ### Background
+
+            In Dec 2024 you audited systemd and found a TOCTOU race in machined's \`OpenShell\` D-Bus method:
+
+            1. **The race window**: \`bus_machine_method_open_shell()\` checks if the caller can access the container's namespaces (line ~377 in machine-dbus.c), then later \`machine_bus_new()\` connects to the container using \`m->leader.pid\`.
+
+            2. **The attack**: An attacker registers a container, calls OpenShell, then kills the container leader between the check and the connection. If the PID gets reused by a privileged process, the attacker could get a shell in that process's namespaces.
+
+            3. **Why it's currently safe**: \`bus_container_connect_socket()\` in bus-container.c calls \`namespace_open(b->nspid, ...)\` which opens namespace FDs **fresh at execution time**. If the PID was reused, the FDs point to the new process's namespaces (not the attacker's target). The attacker can't control which process reuses the PID.
+
+            4. **What would break it**: Caching namespace FDs at check time, connection pooling, or any pattern that separates "which namespaces" from "when we enter them".
 
             ### Review checklist
             - [ ] No namespace FD caching introduced
