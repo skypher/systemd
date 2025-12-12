@@ -1,6 +1,8 @@
 name: Sync with upstream systemd
 
 on:
+  push:
+    branches: [ main ]  # ensure workflow runs (and doesn't error) on changes to main
   schedule:
     # Run every 6 hours
     - cron: '0 */6 * * *'
